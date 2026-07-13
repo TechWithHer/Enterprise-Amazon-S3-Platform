@@ -404,3 +404,56 @@ Same list as before, now with the connective tissue you should be able to articu
 ## Final Words
 
 The original capstone teaches you to configure S3 correctly. This production edition asks you to also defend *why* — with cost numbers, RTO/RPO targets, condition-scoped IAM, and an incident you actually traced end to end. That's the difference between "I completed an S3 course" and "I can operate S3 in production," which is the bar a 3–5 year Cloud Engineer interview will actually test.
+
+
+Sure — let me put my "lead DevOps engineer at CloudMart" hat on and walk you through the reasoning the way I'd actually present it in a design review.
+
+---
+
+**Why multi-account instead of one account with folders/tags?**
+
+The first question I ask on any new platform is: what's my blast radius if something goes wrong? A single account with IAM policies as the only boundary means one bad policy, one leaked access key, or one compromised CI/CD role in "dev" can touch the same finance and legal data that "prod" depends on. IAM is a *logical* boundary — it can be misconfigured. An account boundary is a *hard* boundary enforced by AWS itself. Given that CloudMart stores financial reports and legal documents, I wasn't willing to bet compliance on a policy never having a typo. So dev/staging/prod get their own accounts, and I split out a dedicated log-archive account specifically so that even someone with admin rights in prod can't quietly delete the audit trail of what they just did.
+
+**Why KMS customer-managed keys instead of just SSE-S3?**
+
+SSE-S3 is free and zero-effort, and honestly for the `images/` bucket it'd probably be fine. But for `finance/` and the legal archive, I need two things SSE-S3 can't give me: a key policy I control (so I can restrict *who* can decrypt, not just who can read the object), and an audit trail of every decrypt call via CloudTrail. If we ever get asked "prove that only Finance could read these documents," SSE-S3 gives me nothing to point to. KMS costs a bit more and adds key rotation and cross-account grant complexity for replication — I accepted that operational overhead because the alternative is not being able to answer an audit question.
+
+**Why roles via SSO instead of IAM users?**
+
+Long-lived access keys are the single most common root cause I've seen in incident postmortems — they get committed to repos, they don't rotate, they outlive the employee. Roles assumed through SSO are short-lived by default and tie access back to a real identity provider, so when someone leaves, access disappears the moment their SSO account is deactivated instead of requiring someone to remember to deactivate an IAM user separately.
+
+**Why condition-scoped policies (MFA, TLS version, VPC endpoint) instead of just resource ARNs?**
+
+A resource-scoped policy answers "can this identity touch this object." It doesn't answer "was this a low-risk request." Requiring MFA for deletes, TLS 1.2+ for all requests, and traffic to originate from our VPC endpoint means that even a fully-authorized identity making a request from an unexpected context gets blocked. This is defense in depth — I'm not trusting any single control to be the only thing standing between us and a bad day.
+
+**Why EventBridge instead of wiring S3 notifications straight to Lambda/SNS/SQS?**
+
+Direct S3 event notifications work, but a bucket only supports one notification configuration, and every time a new team wants to consume `images/` upload events, someone has to go edit that config — which means touching infrastructure that other teams already depend on. Routing through EventBridge means new consumers just add a rule on the bus. Nobody has to touch the S3 config again. It's a small extra hop, but it decouples "who owns the bucket" from "who consumes its events," which matters a lot once more than one team is involved.
+
+**Why Intelligent-Tiering for images but manual lifecycle rules for documents/backups?**
+
+Images have unpredictable access patterns — some product photos stay hot for a campaign, most go cold fast, and I don't want to babysit that. Intelligent-Tiering handles it automatically for a small monitoring fee. But documents and backups have *predictable* patterns — a financial report is essentially never read after 90 days — so paying for Intelligent-Tiering's monitoring fee there is wasted money. I'd rather set explicit transitions I can defend with actual access data from Storage Lens than pay for automation I don't need.
+
+**Why Object Lock in Compliance mode for legal documents specifically, not everywhere?**
+
+Compliance mode is intentionally unforgiving — not even the root user can override it before expiry. That's exactly what I want for a document under legal hold, and exactly what I *don't* want for, say, a config backup where an engineer might legitimately need to shorten retention with authorization. So I use Governance mode as the default and reserve Compliance mode for the one bucket where the requirement is genuinely "nobody, ever, no exceptions."
+
+**Why cross-account replication on top of cross-region?**
+
+Cross-region protects me from a regional outage. It does not protect me from someone with legitimate prod credentials deleting or encrypting data maliciously (ransomware-style) — because that same identity often has access to both regions. Putting the DR copy in a separate account with its own, more restrictive access model means a compromised prod credential can't reach the backup at all.
+
+**Why RTC (Replication Time Control) only on `finance/` and `archive/`, not everything?**
+
+RTC costs more per GB replicated. I don't need a 15-minute SLA on product image replication — if it takes two hours, nobody notices. I do need it on the prefixes tied to financial and legal recovery targets, because that's where I've committed to an RTO the business actually cares about. Applying it everywhere would just be spending money to hit an SLA nobody asked for.
+
+**Why GuardDuty + Macie + Config on top of "just enable CloudTrail"?**
+
+CloudTrail tells you what happened *after* you go looking. GuardDuty and Config are the difference between finding out about a problem during an audit six months later versus getting paged within minutes. Macie specifically earns its keep because we're storing customer and financial data — I want to know if PII ends up somewhere it shouldn't (like an `images/` bucket that's more loosely governed) before a customer or regulator finds it for me.
+
+**Why write ADRs for these choices at all?**
+
+Because six months from now, someone — maybe me — is going to ask "why is this so complicated, can we just turn off KMS and use SSE-S3." Without a written record of the trade-off I made and why, that conversation starts from zero every time. The ADRs are how I make sure the next engineer doesn't have to re-derive my reasoning, or worse, undo a control that exists for a compliance reason nobody remembers.
+
+---
+
+The common thread: almost every "extra" piece in this design exists because I asked *what happens when this control fails or is bypassed*, not just *does this satisfy the requirement*. That's usually the question that separates a working demo from something I'd actually be willing to put my name on in production.
