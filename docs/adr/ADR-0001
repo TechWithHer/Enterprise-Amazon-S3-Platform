@@ -1,1 +1,8 @@
 Why Amazon S3 was chosen as the enterprise object storage platform.
+Regulatory and data residency requirements
+Network latency
+Regional resilience and fault isolation
+AWS service maturity and feature availability
+Operational complexity
+Recovery Time Objective (RTO)
+Recovery Point Objective (RPO)
